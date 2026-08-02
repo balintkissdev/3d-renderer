@@ -16,7 +16,6 @@
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <directxmath.h>
-#include <dxgi1_4.h>
 #include <synchapi.h>
 
 #ifdef PIX_ENABLED
@@ -49,6 +48,7 @@ D3D12Renderer::D3D12Renderer(Window& window,
     , cbvSrvUavDescriptorHeapSize_{0}
     , frameIndex_{0}
     , fenceValue_{0}
+    , tearingEnabled_{false}
     , vsyncEnabled_{drawProps.vsyncEnabled}
 {
     models_.reserve(3);
@@ -90,13 +90,13 @@ void D3D12Renderer::cleanup()
 // TODO: Add code to setup WARP device for compatibility
 bool D3D12Renderer::createDevice()
 {
+    HRESULT hr;
     UINT deviceFlags = 0;
 
 #if defined(DEBUG) || defined(_DEBUG)
     {
         com_ptr<ID3D12Debug> debugController;
-        HRESULT hr
-            = D3D12GetDebugInterface(IID_PPV_ARGS(debugController.put()));
+        hr = D3D12GetDebugInterface(IID_PPV_ARGS(debugController.put()));
         if (SUCCEEDED(hr))
         {
             debugController->EnableDebugLayer();
@@ -106,13 +106,17 @@ bool D3D12Renderer::createDevice()
 #endif
 
     com_ptr<IDXGIFactory4> factory;
-    CreateDXGIFactory2(deviceFlags, IID_PPV_ARGS(factory.put()));
+    hr = CreateDXGIFactory2(deviceFlags, IID_PPV_ARGS(factory.put()));
+    if (FAILED(hr))
+    {
+        utils::showErrorMessage("unable to create DXGI factory");
+        return false;
+    }
 
     // Get adapter
     com_ptr<IDXGIAdapter1> adapter;
-
     com_ptr<IDXGIFactory6> factory6;
-    HRESULT hr = factory->QueryInterface(factory6.put());
+    hr = factory->QueryInterface(factory6.put());
     if (FAILED(hr))
     {
         utils::showErrorMessage("unable to create DXGI factory");
@@ -153,6 +157,18 @@ bool D3D12Renderer::createDevice()
         return false;
     }
 
+    // Query tearing support for uncapped framerate with VSync off and DXGI flip
+    // model enabled
+    BOOL allowTearing = false;  // Careful because the Win32 BOOL sizeof (int)
+                                // is not the same as C++ bool size and would
+                                // result in invalid call, it is what it is
+    hr = factory6->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                       &allowTearing,
+                                       sizeof(allowTearing));
+    assert(hr != DXGI_ERROR_INVALID_CALL
+           && "invalid call for tearing support query detected");
+    tearingEnabled_ = SUCCEEDED(hr) && allowTearing;
+
     // Create Swap Chain
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc{};
     swapChainDesc.BufferCount = FRAME_COUNT;
@@ -160,12 +176,28 @@ bool D3D12Renderer::createDevice()
     swapChainDesc.Height = window_.frameBufferSize().second;
     swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+
+    // According to
+    // https://learn.microsoft.com/en-us/windows/win32/api/dxgi/ne-dxgi-dxgi_swap_effect,
+    // never use blit model DXGI_SWAP_EFFECT_DISCARD (implicit 0) because it is
+    // never supported for Direct3D 12 apps. Use the DXGI flip model instead.
+    //
+    // Handling of unthrottled framerate becomes different though after
+    // transitioning from blit to flip model, as now you have to manually query
+    // support for allowing tearing. More info on the DXGI flip model available
+    // here:
+    // https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/for-best-performance--use-dxgi-flip-model
+    // https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-flip-model
     swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    swapChainDesc.Flags
+        = tearingEnabled_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+
     swapChainDesc.SampleDesc.Count = 1;
     swapChainDesc.SampleDesc.Quality = 0;
+
     com_ptr<IDXGISwapChain1> swapChain;
-    // From Direct3D 11.1, Microsoft recommends using this instead of
-    // CreateSwapChain()
+    // From Direct3D 11.1 and onwards, Microsoft recommends using
+    // CreateSwapChainForHwnd instead of CreateSwapChain
     hr = factory->CreateSwapChainForHwnd(commandQueue_.get(),
                                          window_.raw(),
                                          &swapChainDesc,
@@ -795,7 +827,16 @@ void D3D12Renderer::draw(const Scene& scene)
         Globals::takingScreenshot = false;
     }
 
-    swapChain_->Present(vsyncEnabled_, 0);
+    // TODO: When time comes to support fullscreen, make sure to update present
+    // flags according to
+    // https://github.com/microsoft/DirectX-Graphics-Samples/blob/master/Samples/Desktop/D3D12Fullscreen/src/D3D12Fullscreen.cpp
+    //
+    // Presenting with tearing allowed while VSync is on is illegal and you will
+    // go to rendering jail.
+    const UINT presentFlags
+        = (!vsyncEnabled_ && tearingEnabled_) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    HRESULT hr = swapChain_->Present(vsyncEnabled_, presentFlags);
+    assert(SUCCEEDED(hr) && "invalid swapchain present call detected");
     waitForPreviousFrame();
 }
 

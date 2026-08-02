@@ -112,9 +112,11 @@ private:
     UINT64 fenceValue_;
     HANDLE fenceEvent_;
 
-    bool vsyncEnabled_;
     std::vector<D3D12Model> models_;
     D3D12Skybox skybox_;
+
+    bool tearingEnabled_;
+    bool vsyncEnabled_;
 
     bool createDevice();
     bool createCommandObjects();
