@@ -58,7 +58,8 @@ private:
     };
     CB_ALIGNMENT_ASSERT(MaterialConstantBuffer, "Material Constant Buffer");
 
-    static constexpr auto FRAME_COUNT = 2;
+    static constexpr auto MAX_FRAME_COUNT = 2;
+
     static constexpr DXGI_FORMAT DEPTH_STENCIL_FORMAT
         = DXGI_FORMAT_D24_UNORM_S8_UINT;
     static constexpr auto MAX_MODEL_SCENE_NODE_COUNT = 256;
@@ -69,7 +70,8 @@ private:
     winrt::com_ptr<ID3D12Device> device_;
     winrt::com_ptr<IDXGISwapChain3> swapChain_;
     winrt::com_ptr<ID3D12CommandQueue> commandQueue_;
-    winrt::com_ptr<ID3D12CommandAllocator> commandAllocator_;
+    std::array<winrt::com_ptr<ID3D12CommandAllocator>, MAX_FRAME_COUNT>
+        commandAllocators_;
     winrt::com_ptr<ID3D12GraphicsCommandList> commandList_;
     winrt::com_ptr<ID3D12DescriptorHeap> rtvDescriptorHeap_;
     UINT rtvDescriptorHeapSize_;
@@ -85,7 +87,7 @@ private:
     winrt::com_ptr<ID3D12DescriptorHeap> cbvSrvUavDescriptorHeap_;
     UINT cbvSrvUavDescriptorHeapSize_;
 
-    std::array<winrt::com_ptr<ID3D12Resource>, FRAME_COUNT> renderTargets_;
+    std::array<winrt::com_ptr<ID3D12Resource>, MAX_FRAME_COUNT> renderTargets_;
     winrt::com_ptr<ID3D12Resource> depthStencil_;
     // TODO: Move model PSO out of D3D12Renderer
     winrt::com_ptr<ID3D12RootSignature> modelRootSignature_;
@@ -108,8 +110,8 @@ private:
     std::vector<uint8_t*> materialCbvDataBegin_;
 
     winrt::com_ptr<ID3D12Fence> fence_;
-    UINT frameIndex_;
-    UINT64 fenceValue_;
+    UINT currentFrameIndex_;
+    UINT64 fenceValues_[MAX_FRAME_COUNT];
     HANDLE fenceEvent_;
 
     std::vector<D3D12Model> models_;
@@ -119,9 +121,8 @@ private:
     bool vsyncEnabled_;
 
     bool createDevice();
-    bool createCommandObjects();
     bool createDescriptorHeaps();
-    bool createRTVs();
+    bool createFrameResources();
     bool createDSV();
     bool createCBVs();
     template <typename ConstantBufferType>
@@ -140,6 +141,13 @@ private:
                     MaterialConstantBuffer& materialConstantBufferData);
     void drawGui();
     void screenshot();
+
+    // Acts as GPU-to-CPU synchronization point, puts CPU to sleep until GPU
+    // signals back work done. Assumes a complete pipeline flush, as GPU
+    // commands are guaranteed to be consumed until the sync command is reached
+    // and GPU is guaranteed to be idle. Independent from frame and sync point
+    // is set up within current frame.
+    void waitForGPU();
     void waitForPreviousFrame();
 };
 

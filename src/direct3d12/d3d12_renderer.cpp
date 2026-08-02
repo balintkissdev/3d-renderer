@@ -46,8 +46,8 @@ D3D12Renderer::D3D12Renderer(Window& window,
                    window_.frameBufferSize().second}
     , rtvDescriptorHeapSize_{0}
     , cbvSrvUavDescriptorHeapSize_{0}
-    , frameIndex_{0}
-    , fenceValue_{0}
+    , currentFrameIndex_{0}
+    , fenceValues_{}
     , tearingEnabled_{false}
     , vsyncEnabled_{drawProps.vsyncEnabled}
 {
@@ -61,21 +61,16 @@ D3D12Renderer::~D3D12Renderer()
 
 bool D3D12Renderer::init()
 {
-    if (!createDevice() || !createCommandObjects() || !createDescriptorHeaps()
-        || !createRTVs() || !createDSV() || !createCBVs()
-        || !createModelRootSignature() || !createModelPSO() || !loadAssets())
+    if (!createDevice() || !createDescriptorHeaps() || !createFrameResources()
+        || !createDSV() || !createCBVs() || !createModelRootSignature()
+        || !createModelPSO() || !loadAssets())
     {
         return false;
     }
 
-    // Flush command list to apply texture uploads
-    commandList_->Close();
-    ID3D12CommandList* commandLists[] = {commandList_.get()};
-    commandQueue_->ExecuteCommandLists(1, commandLists);
-
     createSyncObjects();
     // Wait for setup to complete
-    waitForPreviousFrame();
+    waitForGPU();
 
     setVSyncEnabled(drawProps_.vsyncEnabled);
     return true;
@@ -83,8 +78,26 @@ bool D3D12Renderer::init()
 
 void D3D12Renderer::cleanup()
 {
-    waitForPreviousFrame();
+    waitForGPU();  // Avoid corruption of resources
     ::CloseHandle(fenceEvent_);
+
+#if defined(DEBUG) || defined(_DEBUG)
+    // If debug layer is kept being enabled when switching from OpenGL back to
+    // Direct3D 12 backend, results in crash when debug layer is being enabled
+    // twice on the same adapter. Alternative is guarding first time debug layer
+    // enabling with a static bool to do lazy initialization.
+    com_ptr<ID3D12Debug> debugController;
+    HRESULT hr = D3D12GetDebugInterface(IID_PPV_ARGS(debugController.put()));
+    if (SUCCEEDED(hr))
+    {
+        com_ptr<ID3D12Debug4> debugController4;
+        hr = debugController->QueryInterface(debugController4.put());
+        if (SUCCEEDED(hr))
+        {
+            debugController4->DisableDebugLayer();
+        }
+    }
+#endif
 }
 
 // TODO: Add code to setup WARP device for compatibility
@@ -171,7 +184,7 @@ bool D3D12Renderer::createDevice()
 
     // Create Swap Chain
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc{};
-    swapChainDesc.BufferCount = FRAME_COUNT;
+    swapChainDesc.BufferCount = MAX_FRAME_COUNT;
     swapChainDesc.Width = window_.frameBufferSize().first;
     swapChainDesc.Height = window_.frameBufferSize().second;
     swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -217,32 +230,35 @@ bool D3D12Renderer::createDevice()
     }
     // Fullscreen transitions not supported
     factory->MakeWindowAssociation(window_.raw(), DXGI_MWA_NO_ALT_ENTER);
-    frameIndex_ = swapChain_->GetCurrentBackBufferIndex();
+    currentFrameIndex_ = swapChain_->GetCurrentBackBufferIndex();
     return true;
 }
 
-bool D3D12Renderer::createCommandObjects()
+bool D3D12Renderer::createFrameResources()
 {
-    // Command Allocator
-    HRESULT hr = device_->CreateCommandAllocator(
-        D3D12_COMMAND_LIST_TYPE_DIRECT,
-        IID_PPV_ARGS(commandAllocator_.put()));
-    if (FAILED(hr))
-    {
-        utils::showErrorMessage("unable to create Command Allocator");
-        return false;
-    }
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvCpuHandle(
+        rtvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart());
 
-    // Command List
-    hr = device_->CreateCommandList(0,
-                                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                    commandAllocator_.get(),
-                                    nullptr,
-                                    IID_PPV_ARGS(commandList_.put()));
-    if (FAILED(hr))
+    for (size_t frame = 0; frame < commandAllocators_.size(); ++frame)
     {
-        utils::showErrorMessage("unable to create Command List");
-        return false;
+        // Render Target View (RTV) for each frame
+        swapChain_->GetBuffer(frame, IID_PPV_ARGS(renderTargets_[frame].put()));
+        device_->CreateRenderTargetView(renderTargets_[frame].get(),
+                                        nullptr,
+                                        rtvCpuHandle);
+        rtvCpuHandle.Offset(1, rtvDescriptorHeapSize_);
+
+        // Command Allocator for each frame
+        HRESULT hr = device_->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(commandAllocators_[frame].put()));
+        if (FAILED(hr))
+        {
+            utils::showErrorMessage(
+                "unable to create Command Allocator for frame",
+                frame);
+            return false;
+        }
     }
 
     return true;
@@ -252,7 +268,7 @@ bool D3D12Renderer::createDescriptorHeaps()
 {
     // Render Target View (RTV) descriptor heap
     D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc{};
-    rtvHeapDesc.NumDescriptors = FRAME_COUNT;
+    rtvHeapDesc.NumDescriptors = MAX_FRAME_COUNT;
     rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     if (FAILED(device_->CreateDescriptorHeap(
@@ -294,24 +310,6 @@ bool D3D12Renderer::createDescriptorHeaps()
     }
     cbvSrvUavDescriptorHeapSize_ = device_->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-
-    return true;
-}
-
-bool D3D12Renderer::createRTVs()
-{
-    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvCpuHandle(
-        rtvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart());
-
-    // RTV for each frame
-    for (UINT i = 0; i < FRAME_COUNT; ++i)
-    {
-        swapChain_->GetBuffer(i, IID_PPV_ARGS(renderTargets_[i].put()));
-        device_->CreateRenderTargetView(renderTargets_[i].get(),
-                                        nullptr,
-                                        rtvCpuHandle);
-        rtvCpuHandle.Offset(1, rtvDescriptorHeapSize_);
-    }
 
     return true;
 }
@@ -611,23 +609,26 @@ bool D3D12Renderer::createModelPSO()
 
 bool D3D12Renderer::createSyncObjects()
 {
+    // Direct3D 12 GPU hardware fence
     HRESULT hr = device_->CreateFence(0,
                                       D3D12_FENCE_FLAG_NONE,
                                       IID_PPV_ARGS(fence_.put()));
     if (FAILED(hr))
     {
         HRESULT removedReason = E_FAIL;
-        if (!device_)
+        if (device_)
         {
             removedReason = device_->GetDeviceRemovedReason();
         }
         utils::showErrorMessage("unable to create fence", hr, removedReason);
         return false;
     }
-    fenceValue_ = 1;
 
-    fenceEvent_ = ::CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    if (fenceEvent_ == nullptr)
+    fenceValues_[currentFrameIndex_] = 1;
+
+    // Win32 OS Event handle to make thread scheduler sleep or wake up the CPU
+    fenceEvent_ = ::CreateEvent(nullptr, false, false, nullptr);
+    if (!fenceEvent_)
     {
         const DWORD e = ::GetLastError();
         utils::showErrorMessage("unable to create fence event", e);
@@ -639,6 +640,22 @@ bool D3D12Renderer::createSyncObjects()
 
 bool D3D12Renderer::loadAssets()
 {
+    // Command list
+    HRESULT hr = device_->CreateCommandList(
+        0,
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        commandAllocators_[currentFrameIndex_].get(),
+        nullptr,
+        IID_PPV_ARGS(commandList_.put()));
+    if (FAILED(hr))
+    {
+        utils::showErrorMessage("unable to create Command List");
+        return false;
+    }
+    // By default, command lists are created in "Record" state and have to be
+    // set to "Closed" state later. Keep it open for now to record skybox
+    // texture (and other resource) upload commands.
+
     // Models
     const std::array<fs::path, 3> modelPaths{"assets/meshes/cube.obj",
                                              "assets/meshes/teapot.obj",
@@ -681,6 +698,11 @@ bool D3D12Renderer::loadAssets()
     }
     skybox_ = std::move(skybox.value());
 
+    // Flush command list to apply texture uploads
+    commandList_->Close();
+    ID3D12CommandList* commandLists[] = {commandList_.get()};
+    commandQueue_->ExecuteCommandLists(1, commandLists);
+
     return true;
 }
 
@@ -708,7 +730,7 @@ void D3D12Renderer::initImGuiBackend()
     // See:
     // https://github.com/ocornut/imgui/blob/c0dfd65d6790b9b96872b64fa232f1fa80fcd3b3/examples/example_win32_directx12/main.cpp#L37
     ImGui_ImplDX12_Init(device_.get(),
-                        FRAME_COUNT,
+                        MAX_FRAME_COUNT,
                         renderTargets_[0]->GetDesc().Format,
                         cbvSrvUavDescriptorHeap_.get(),
                         srvCpuHandle,
@@ -750,8 +772,8 @@ void D3D12Renderer::draw(const Scene& scene)
     materialConstantBufferData.lightDirection.z = drawProps_.lightDirection[2];
 
     // Begin frame
-    commandAllocator_->Reset();
-    commandList_->Reset(commandAllocator_.get(), nullptr);
+    commandAllocators_[currentFrameIndex_]->Reset();
+    commandList_->Reset(commandAllocators_[currentFrameIndex_].get(), nullptr);
     PIX_EVENT(commandList_.get(), "D3D12Renderer::draw");
 
     // Set render state
@@ -770,7 +792,7 @@ void D3D12Renderer::draw(const Scene& scene)
     commandList_->RSSetScissorRects(1, &scissorRect_);
 
     // Set backbuffer as render target
-    ID3D12Resource* renderTarget = renderTargets_[frameIndex_].get();
+    ID3D12Resource* renderTarget = renderTargets_[currentFrameIndex_].get();
     CD3DX12_RESOURCE_BARRIER transitionBarrier
         = CD3DX12_RESOURCE_BARRIER::Transition(
             renderTarget,
@@ -779,7 +801,7 @@ void D3D12Renderer::draw(const Scene& scene)
     commandList_->ResourceBarrier(1, &transitionBarrier);
     CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(
         rtvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart(),
-        static_cast<int>(frameIndex_),
+        static_cast<int>(currentFrameIndex_),
         rtvDescriptorHeapSize_);
     CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(
         dsvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart());
@@ -929,15 +951,15 @@ void D3D12Renderer::drawGui()
 void D3D12Renderer::screenshot()
 {
     // Wait for drawing to finish
-    waitForPreviousFrame();
+    waitForGPU();
 
-    commandAllocator_->Reset();
-    commandList_->Reset(commandAllocator_.get(), nullptr);
+    commandAllocators_[currentFrameIndex_]->Reset();
+    commandList_->Reset(commandAllocators_[currentFrameIndex_].get(), nullptr);
 
     // Backbuffer (GPU)
     com_ptr<ID3D12Resource> backBuffer;
-    HRESULT hr
-        = swapChain_->GetBuffer(frameIndex_, IID_PPV_ARGS(backBuffer.put()));
+    HRESULT hr = swapChain_->GetBuffer(currentFrameIndex_,
+                                       IID_PPV_ARGS(backBuffer.put()));
     if (FAILED(hr))
     {
         utils::showErrorMessage("unable to query backbuffer for screenshot");
@@ -999,7 +1021,7 @@ void D3D12Renderer::screenshot()
     commandQueue_->ExecuteCommandLists(1, commandLists);
 
     // Wait until copy is finished
-    waitForPreviousFrame();
+    waitForGPU();
 
     // Read data into CPU buffer
     void* readbackBufferData = nullptr;
@@ -1040,18 +1062,49 @@ void D3D12Renderer::screenshot()
     }
 }
 
-void D3D12Renderer::waitForPreviousFrame()
+void D3D12Renderer::waitForGPU()
 {
-    // Wait for previous frame to complete before continue
-    // (NOT BEST PRACTICE!)
-    const UINT64 fence = fenceValue_;
-    commandQueue_->Signal(fence_.get(), fence);
-    ++fenceValue_;
+    // Ask GPU to write fence value when commands that were submitted before
+    // "signal" command are done.
+    commandQueue_->Signal(fence_.get(), fenceValues_[currentFrameIndex_]);
 
-    if (fence_->GetCompletedValue() < fence)
+    // Skip unnecessary CPU wait if GPU is already caught up with finished work.
+    // GPU is faster then you think, it could have even finished processing the
+    // command queue and reached the "signal" command right before CPU stepped
+    // to the next code line in here.
+    if (fence_->GetCompletedValue() < fenceValues_[currentFrameIndex_])
     {
-        fence_->SetEventOnCompletion(fence, fenceEvent_);
+        // Ask GPU fence to trigger Win32 Event when done
+        fence_->SetEventOnCompletion(fenceValues_[currentFrameIndex_],
+                                     fenceEvent_);
+
+        // Sleep CPU until fence has been processed. This is not some
+        // power-wasting spinlock, Windows thread scheduler suspends this thread
+        // and yields control to other apps or OS tasks.
         ::WaitForSingleObject(fenceEvent_, INFINITE);
     }
-    frameIndex_ = swapChain_->GetCurrentBackBufferIndex();
+
+    // Fence value is incremented for next synchronization point in current
+    // frame, not for next frame itself.
+    ++fenceValues_[currentFrameIndex_];
+}
+
+void D3D12Renderer::waitForPreviousFrame()
+{
+    // Schedule "signal" command for CURRENT frame
+    const UINT64 currentFenceValue = fenceValues_[currentFrameIndex_];
+    commandQueue_->Signal(fence_.get(), currentFenceValue);
+
+    // Step to next frame
+    currentFrameIndex_ = swapChain_->GetCurrentBackBufferIndex();
+
+    if (fence_->GetCompletedValue() < fenceValues_[currentFrameIndex_])
+    {
+        fence_->SetEventOnCompletion(fenceValues_[currentFrameIndex_],
+                                     fenceEvent_);
+        ::WaitForSingleObject(fenceEvent_, INFINITE);
+    }
+
+    // Fence value for next frame
+    fenceValues_[currentFrameIndex_] = currentFenceValue + 1;
 }
